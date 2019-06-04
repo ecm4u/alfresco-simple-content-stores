@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Acosix GmbH
+ * Copyright 2017, 2018 Acosix GmbH
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,12 @@ package de.acosix.alfresco.simplecontentstores.repo.store.file;
 import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
-import java.util.Calendar;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
-import java.util.GregorianCalendar;
-import java.util.Locale;
+import java.util.HashMap;
 import java.util.Map;
-import java.util.TimeZone;
+import java.util.stream.Stream;
 
 import org.alfresco.error.AlfrescoRuntimeException;
 import org.alfresco.repo.content.AbstractContentStore;
@@ -33,14 +33,13 @@ import org.alfresco.repo.content.ContentStore;
 import org.alfresco.repo.content.ContentStoreCreatedEvent;
 import org.alfresco.repo.content.EmptyContentReader;
 import org.alfresco.repo.content.UnsupportedContentUrlException;
+import org.alfresco.repo.content.filestore.FileContentUrlProvider;
 import org.alfresco.repo.content.filestore.SpoofedTextContentReader;
 import org.alfresco.service.cmr.repository.ContentIOException;
 import org.alfresco.service.cmr.repository.ContentReader;
 import org.alfresco.service.cmr.repository.ContentWriter;
-import org.alfresco.util.Deleter;
 import org.alfresco.util.Pair;
 import org.alfresco.util.PropertyCheck;
-import org.apache.commons.io.FilenameUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeansException;
@@ -50,7 +49,6 @@ import org.springframework.context.ApplicationContextAware;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ContextRefreshedEvent;
 import org.springframework.extensions.surf.util.ParameterCheck;
-import org.springframework.extensions.webscripts.GUID;
 
 import de.acosix.alfresco.simplecontentstores.repo.store.ContentUrlUtils;
 import de.acosix.alfresco.simplecontentstores.repo.store.StoreConstants;
@@ -88,6 +86,8 @@ public class FileContentStore extends AbstractContentStore
 
     protected boolean deleteEmptyDirs = true;
 
+    protected FileContentUrlProvider fileContentUrlProvider;
+
     /**
      *
      * {@inheritDoc}
@@ -95,8 +95,6 @@ public class FileContentStore extends AbstractContentStore
     @Override
     public void afterPropertiesSet()
     {
-        PropertyCheck.mandatory(this, "applicationContext", this.applicationContext);
-
         PropertyCheck.mandatory(this, "rootAbsolutePath", this.rootAbsolutePath);
         PropertyCheck.mandatory(this, "protocol", this.protocol);
 
@@ -111,10 +109,28 @@ public class FileContentStore extends AbstractContentStore
             throw new ContentIOException("Failed to create store root: " + this.rootDirectory, null);
         }
 
+        if (this.fileContentUrlProvider == null)
+        {
+            this.fileContentUrlProvider = new TimeBasedFileContentUrlProvider();
+            ((TimeBasedFileContentUrlProvider) this.fileContentUrlProvider).setStoreProtocol(this.protocol);
+        }
+        else
+        {
+            final String createNewFileStoreUrl = this.fileContentUrlProvider.createNewFileStoreUrl();
+            if (!createNewFileStoreUrl.startsWith(this.protocol + ContentStore.PROTOCOL_DELIMITER))
+            {
+                this.fileContentUrlProvider = new AlternativeProtocolFileContentUrlProviderFacade(this.fileContentUrlProvider,
+                        this.protocol);
+            }
+        }
+
         this.rootDirectory = this.rootDirectory.getAbsoluteFile();
         this.rootAbsolutePath = this.rootDirectory.getAbsolutePath();
 
-        this.applicationContext.publishEvent(new ContentStoreCreatedEvent(this, this.extendedEventParameters));
+        if (this.applicationContext != null)
+        {
+            this.applicationContext.publishEvent(new ContentStoreCreatedEvent(this, this.extendedEventParameters));
+        }
     }
 
     /**
@@ -133,7 +149,8 @@ public class FileContentStore extends AbstractContentStore
      */
     public void setExtendedEventParameters(final Map<String, Serializable> extendedEventParameters)
     {
-        this.extendedEventParameters = extendedEventParameters;
+        // decouple map
+        this.extendedEventParameters = extendedEventParameters != null ? new HashMap<>(extendedEventParameters) : null;
     }
 
     /**
@@ -207,6 +224,15 @@ public class FileContentStore extends AbstractContentStore
     }
 
     /**
+     * @param fileContentUrlProvider
+     *            the fileContentUrlProvider to set
+     */
+    public void setFileContentUrlProvider(final FileContentUrlProvider fileContentUrlProvider)
+    {
+        this.fileContentUrlProvider = fileContentUrlProvider;
+    }
+
+    /**
      *
      * {@inheritDoc}
      */
@@ -218,8 +244,6 @@ public class FileContentStore extends AbstractContentStore
             this.extendedEventParameters = Collections.<String, Serializable> emptyMap();
         }
 
-        // Once the context has been refreshed, we tell other interested beans about the existence of this content store
-        // (e.g. for monitoring purposes)
         if (event.getSource() == this.applicationContext)
         {
             final ApplicationContext context = event.getApplicationContext();
@@ -259,7 +283,7 @@ public class FileContentStore extends AbstractContentStore
         {
             rootLocation = this.rootDirectory.getCanonicalPath();
         }
-        catch (final Throwable e)
+        catch (final IOException | SecurityException e)
         {
             LOGGER.warn("Unabled to return root location", e);
             rootLocation = super.getRootLocation();
@@ -297,8 +321,8 @@ public class FileContentStore extends AbstractContentStore
         }
         else
         {
-            final File file = this.makeFile(effectiveContentUrl);
-            result = file.exists();
+            final Path filePath = this.makeFilePath(effectiveContentUrl);
+            result = Files.exists(filePath) && !Files.isDirectory(filePath);
         }
         return result;
     }
@@ -316,20 +340,18 @@ public class FileContentStore extends AbstractContentStore
         final String protocol = urlParts.getFirst();
 
         ContentReader reader;
-        // Handle the spoofed URL
         if (protocol.equals(SPOOF_PROTOCOL))
         {
             reader = new SpoofedTextContentReader(effectiveContentUrl);
         }
         else
         {
-            // else, it's a real file we are after
             try
             {
-                final File file = this.makeFile(effectiveContentUrl);
-                if (file.exists())
+                final Path filePath = this.makeFilePath(effectiveContentUrl);
+                if (Files.exists(filePath) && !Files.isDirectory(filePath))
                 {
-                    final FileContentReaderImpl fileContentReader = new FileContentReaderImpl(file, effectiveContentUrl);
+                    final FileContentReaderImpl fileContentReader = new FileContentReaderImpl(filePath.toFile(), effectiveContentUrl);
 
                     fileContentReader.setAllowRandomAccess(this.allowRandomAccess);
 
@@ -340,17 +362,11 @@ public class FileContentStore extends AbstractContentStore
                     reader = new EmptyContentReader(effectiveContentUrl);
                 }
 
-                // done
-                LOGGER.debug("Created content reader: \n   url: {}\n   file: {}\n   reader: {]", effectiveContentUrl, file, reader);
+                LOGGER.debug("Created content reader: \n   url: {}\n   file: {}\n   reader: {]", effectiveContentUrl, filePath, reader);
             }
             catch (final UnsupportedContentUrlException e)
             {
-                // This can go out directly
                 throw e;
-            }
-            catch (final Throwable e)
-            {
-                throw new ContentIOException("Failed to get reader for URL: " + effectiveContentUrl, e);
             }
         }
         return reader;
@@ -381,26 +397,31 @@ public class FileContentStore extends AbstractContentStore
         }
         else
         {
-            // Handle regular files based on the real files
-            final File file = this.makeFile(effectiveContentUrl);
-            if (!file.exists())
+            final Path filePath = this.makeFilePath(effectiveContentUrl);
+            if (!Files.isRegularFile(filePath))
             {
-                // File does not exist
+                LOGGER.debug("Path {} does not denote an existing content file - treating as already deleted", filePath);
                 deleted = true;
             }
             else
             {
-                deleted = file.delete();
+                try
+                {
+                    Files.delete(filePath);
+                    deleted = true;
+                    LOGGER.debug("Deleted content file {}", filePath);
+                }
+                catch (final IOException e)
+                {
+                    LOGGER.warn("Error deleting content file {}", filePath, e);
+                    deleted = false;
+                }
             }
 
-            // Delete empty parents regardless of whether the file was ignore above.
             if (this.deleteEmptyDirs && deleted)
             {
-                Deleter.deleteEmptyParents(file, this.getRootLocation());
+                this.deleteEmptyParents(filePath, this.rootDirectory);
             }
-
-            // done
-            LOGGER.debug("Delete content directly: \n   store: {}\n   url: {}", this, effectiveContentUrl);
         }
 
         return deleted;
@@ -429,17 +450,15 @@ public class FileContentStore extends AbstractContentStore
         try
         {
             File file = null;
-            if (newContentUrl == null) // a specific URL was not supplied
+            if (newContentUrl == null)
             {
                 contentUrl = this.createNewFileStoreUrl();
             }
             else
-            // the URL has been given
             {
                 contentUrl = ContentUrlUtils.checkAndReplaceWildcardProtocol(newContentUrl, this.protocol);
             }
             file = this.createNewFile(contentUrl);
-            // create the writer
             final FileContentWriterImpl writer = new FileContentWriterImpl(file, contentUrl, existingContentReader);
 
             if (this.contentLimitProvider != null)
@@ -449,12 +468,12 @@ public class FileContentStore extends AbstractContentStore
 
             writer.setAllowRandomAccess(this.allowRandomAccess);
 
-            // done
             LOGGER.debug("Created content writer: \n   writer: {}", writer);
             return writer;
         }
         catch (final Throwable e)
         {
+            LOGGER.error("Error creating writer for {}", contentUrl, e);
             throw new ContentIOException("Failed to get writer for URL: " + contentUrl, e);
         }
     }
@@ -481,66 +500,25 @@ public class FileContentStore extends AbstractContentStore
             throw new UnsupportedOperationException("This store is currently read-only: " + this);
         }
 
-        final File file = this.makeFile(newContentUrl);
+        final Path filePath = this.makeFilePath(newContentUrl);
 
-        // create the directory, if it doesn't exist
-        final File dir = file.getParentFile();
-        if (!dir.exists())
-        {
-            this.makeDirectory(dir);
-        }
-
-        // create a new, empty file
-        final boolean created = file.createNewFile();
-        if (!created)
+        if (Files.exists(filePath))
         {
             throw new ContentIOException("When specifying a URL for new content, the URL may not be in use already. \n" + "   store: "
                     + this + "\n" + "   new URL: " + newContentUrl);
         }
 
-        // done
-        return file;
-    }
-
-    /**
-     * Synchronized and retrying directory creation. Repeated attempts will be made to create the directory, subject to a limit on the
-     * number of retries.
-     *
-     * @param dir
-     *            the directory to create
-     * @throws IOException
-     *             if an IO error occurs
-     */
-    protected synchronized void makeDirectory(final File dir) throws IOException
-    {
-        final int tries = 0;
-        boolean created = false;
-
-        try
+        LOGGER.trace("Creating content file {}", filePath);
+        final Path parentPath = filePath.getParent();
+        // unlikely but possible due to API definition
+        if (parentPath != null)
         {
-            // 20 attempts with 20 ms wait each time
-            while (!dir.exists() && !created && tries < 20)
-            {
-                created = dir.mkdirs();
+            Files.createDirectories(parentPath);
+        }
+        Files.createFile(filePath);
+        LOGGER.debug("Created content file {}", filePath);
 
-                if (!created)
-                {
-                    // Wait
-                    this.wait(20L);
-                }
-            }
-        }
-        catch (final InterruptedException e)
-        {
-            // can't just ignore an interruption
-            throw new ContentIOException("Interrupted during directory creation", e);
-        }
-
-        if (!created && !dir.exists())
-        {
-            // It still didn't succeed
-            throw new ContentIOException("Failed to create directory for file storage: " + dir);
-        }
+        return filePath.toFile();
     }
 
     /**
@@ -555,29 +533,24 @@ public class FileContentStore extends AbstractContentStore
     protected String makeContentUrl(final File file)
     {
         final String path = file.getAbsolutePath();
-        // check if it belongs to this store
         if (!path.startsWith(this.rootAbsolutePath))
         {
             throw new AlfrescoRuntimeException(
                     "File does not fall below the store's root: \n" + "   file: " + file + "\n" + "   store: " + this);
         }
-        // strip off the file separator char, if present
         int index = this.rootAbsolutePath.length();
         if (path.charAt(index) == File.separatorChar)
         {
             index++;
         }
 
-        // strip off the root path and adds the protocol prefix
         String url = this.protocol + ContentStore.PROTOCOL_DELIMITER + path.substring(index);
-        // replace '\' with '/' so that URLs are consistent across all filesystems
         url = url.replace('\\', '/');
-        // done
         return url;
     }
 
     /**
-     * Creates a file from the given relative URL.
+     * Creates a file path from the given relative URL.
      *
      * @param contentUrl
      *            the content URL including the protocol prefix
@@ -585,55 +558,39 @@ public class FileContentStore extends AbstractContentStore
      * @throws UnsupportedContentUrlException
      *             if the URL is invalid and doesn't support the {@link FileContentStore#STORE_PROTOCOL correct protocol}
      */
-    protected File makeFile(final String contentUrl)
+    protected Path makeFilePath(final String contentUrl)
     {
         final String baseContentUrl = ContentUrlUtils.getBaseContentUrl(contentUrl);
         final Pair<String, String> urlParts = this.getContentUrlParts(baseContentUrl);
         final String protocol = urlParts.getFirst();
         final String relativePath = urlParts.getSecond();
-        return this.makeFile(protocol, relativePath);
+        return this.makeFilePath(protocol, relativePath);
     }
 
     /**
-     * Creates a file object based on the content URL parts.
+     * Creates a file path based on the content URL parts.
      *
      * @param protocol
      *            must be {@link ContentStore#PROTOCOL_DELIMITER} for this class
      * @param relativePath
      *            the relative path to turn into a file
-     * @return the file for the path
+     * @return the file path
      */
-    protected File makeFile(final String protocol, final String relativePath)
+    protected Path makeFilePath(final String protocol, final String relativePath)
     {
-        // Check the protocol
         if (!StoreConstants.WILDCARD_PROTOCOL.equals(protocol) && !this.protocol.equals(protocol))
         {
             throw new UnsupportedContentUrlException(this, protocol + PROTOCOL_DELIMITER + relativePath);
         }
-        // get the file
-        final File file = new File(this.rootDirectory, relativePath);
 
-        this.ensureFileInContentStore(file);
-
-        // done
-        return file;
-    }
-
-    /**
-     * Checks that the file to be accessed by this content store is actually content inside of the root location.
-     *
-     * @param file
-     *            the file to check for containment in this store
-     */
-    protected void ensureFileInContentStore(final File file)
-    {
-        final String fileNormalizedAbsoultePath = FilenameUtils.normalize(file.getAbsolutePath());
-        final String rootNormalizedAbsolutePath = FilenameUtils.normalize(this.rootAbsolutePath);
-
-        if (!fileNormalizedAbsoultePath.startsWith(rootNormalizedAbsolutePath))
+        final Path rootPath = this.rootDirectory.toPath();
+        final Path filePath = rootPath.resolve(relativePath);
+        if (!filePath.startsWith(rootPath))
         {
-            throw new ContentIOException("Access to files outside of content store root is not allowed: " + file);
+            throw new ContentIOException("Access to files outside of content store root is not allowed: " + filePath);
         }
+
+        return filePath;
     }
 
     /**
@@ -643,20 +600,52 @@ public class FileContentStore extends AbstractContentStore
      */
     protected String createNewFileStoreUrl()
     {
-        // expectation is that date/time components are same as in legacy FileContentStore
-        // this means we must use the system default timezone
-        final Calendar calendar = new GregorianCalendar(TimeZone.getDefault(), Locale.ENGLISH);
-        final int year = calendar.get(Calendar.YEAR);
-        final int month = calendar.get(Calendar.MONTH) + 1; // 0-based
-        final int day = calendar.get(Calendar.DAY_OF_MONTH);
-        final int hour = calendar.get(Calendar.HOUR_OF_DAY);
-        final int minute = calendar.get(Calendar.MINUTE);
-        // create the URL
-        final StringBuilder sb = new StringBuilder(20);
-        sb.append(this.protocol).append(ContentStore.PROTOCOL_DELIMITER).append(year).append('/').append(month).append('/').append(day)
-                .append('/').append(hour).append('/').append(minute).append('/').append(GUID.generate()).append(".bin");
-        final String newContentUrl = sb.toString();
-        // done
+        final String newContentUrl = this.fileContentUrlProvider.createNewFileStoreUrl();
         return newContentUrl;
+    }
+
+    protected void deleteEmptyParents(final Path filePath, final File rootDirectory)
+    {
+        final Path rootDirectoryPath = rootDirectory.toPath();
+
+        Path curPath = filePath.getParent();
+        try
+        {
+            while (!Files.isSameFile(rootDirectoryPath, curPath))
+            {
+                if (Files.isSymbolicLink(curPath))
+                {
+                    LOGGER.debug("Aborting deletion of empty parents as {} is a symbolic link", curPath);
+                    break;
+                }
+
+                if (!Files.isDirectory(curPath))
+                {
+                    LOGGER.debug("Aborting deletion of empty parents as {} is not a directory", curPath);
+                    break;
+                }
+
+                final long children;
+                try (Stream<Path> stream = Files.list(curPath))
+                {
+                    children = stream.count();
+                }
+
+                if (children != 0)
+                {
+                    LOGGER.debug("Aborting deletion of empty parents as {} is not empty", curPath);
+                    break;
+                }
+
+                LOGGER.trace("Deleting empty parent {}", curPath);
+                Files.delete(curPath);
+                LOGGER.debug("Deleted empty parent {}", curPath);
+                curPath = curPath.getParent();
+            }
+        }
+        catch (final IOException e)
+        {
+            LOGGER.warn("Error deleting empty parent directories", e);
+        }
     }
 }
